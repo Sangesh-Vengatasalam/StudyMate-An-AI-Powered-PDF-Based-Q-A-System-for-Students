@@ -1,6 +1,9 @@
+
 import os
+from io import BytesIO
+
 import streamlit as st
-import fitz  # PyMuPDF for PDF
+import fitz  # PyMuPDF
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -8,67 +11,151 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 from docx import Document
 from pptx import Presentation
+
+# ------------------------------
+# Load environment variables
+# ------------------------------
 load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", None)
+if not GEMINI_API_KEY:
+    st.warning("GEMINI_API_KEY not found in environment. Please set it in your .env file.")
 
 # Configure Gemini client
 genai.configure(api_key=GEMINI_API_KEY)
 
-def extract_text(uploaded_file):
-    """Extract text from PDF, DOCX, or PPTX"""
+# ------------------------------
+# Utility Functions
+# ------------------------------
+def extract_text(uploaded_file) -> str:
+    """
+    Extract text from uploaded file. Supports PDF, DOCX, PPTX (and PPT), TXT.
+    Returns a single string ('' if nothing found / unsupported).
+    """
+    data = uploaded_file.read()
+    if not data:
+        return ""
+    bio = BytesIO(data)
     file_name = uploaded_file.name.lower()
 
     # PDF
     if file_name.endswith(".pdf"):
-        doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-        text = ""
-        for page in doc:
-            text += page.get_text("text")
-        return text
+        try:
+            doc = fitz.open(stream=data, filetype="pdf")
+            text = ""
+            for page in doc:
+                page_text = page.get_text("text")
+                if page_text:
+                    text += page_text + "\n"
+            return text.strip()
+        except Exception:
+            return ""
 
     # DOCX
-    elif file_name.endswith(".docx"):
-        doc = Document(uploaded_file)
-        text = "\n".join([para.text for para in doc.paragraphs])
-        return text
+    if file_name.endswith(".docx"):
+        try:
+            bio.seek(0)
+            doc = Document(bio)
+            paras = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+            return "\n".join(paras).strip()
+        except Exception:
+            return ""
 
-    # PPTX
-    elif file_name.endswith(".pptx") or file_name.endswith(".ppt"):
-        prs = Presentation(uploaded_file)
-        text = ""
-        for slide in prs.slides:
-            for shape in slide.shapes:
-                if hasattr(shape, "text"):
-                    text += shape.text + "\n"
-        return text
+    # PPTX / PPT
+    if file_name.endswith(".pptx") or file_name.endswith(".ppt"):
+        try:
+            bio.seek(0)
+            prs = Presentation(bio)
+            texts = []
+            for slide in prs.slides:
+                for shape in slide.shapes:
+                    # some shapes have .text, some don't
+                    if hasattr(shape, "text") and shape.text and shape.text.strip():
+                        texts.append(shape.text.strip())
+            return "\n".join(texts).strip()
+        except Exception:
+            return ""
 
-    else:
-        return "⚠️ Unsupported file format"
+    # TXT
+    if file_name.endswith(".txt"):
+        try:
+            return data.decode(errors="ignore").strip()
+        except Exception:
+            return ""
 
-def chunk_text(text, chunk_size=500):
-    """Splits text into chunks"""
+    # unsupported
+    return ""
+
+
+def chunk_text(text: str, chunk_size: int = 500):
+    """
+    Split by words into chunks of chunk_size words.
+    Returns list of chunk strings.
+    """
+    if not text or not text.strip():
+        return []
     words = text.split()
-    return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
+    return [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+
 
 def build_faiss_index(chunks, embedder):
-    """Builds FAISS index from text chunks"""
-    embeddings = embedder.encode(chunks)
+    """
+    Build FAISS index from chunk list and return (index, embeddings).
+    Ensures embeddings are float32 and 2D.
+    """
+    if not chunks:
+        raise ValueError("No chunks provided to build FAISS index.")
+
+    # SentenceTransformer has a convert_to_numpy parameter in many versions,
+    # but for compatibility, attempt it; otherwise wrap in np.array.
+    try:
+        embeddings = embedder.encode(chunks, convert_to_numpy=True)
+    except TypeError:
+        embeddings = embedder.encode(chunks)
+
+    embeddings = np.array(embeddings, dtype="float32")
+    embeddings = np.atleast_2d(embeddings)
+    embeddings = np.ascontiguousarray(embeddings)
+
     dim = embeddings.shape[1]
     index = faiss.IndexFlatL2(dim)
-    index.add(np.array(embeddings))
+    index.add(embeddings)  # embeddings.shape => (n, dim)
     return index, embeddings
 
+
 def retrieve_answer(query, chunks, index, embedder, top_k=3):
-    """Retrieves most relevant chunks using FAISS"""
-    query_emb = embedder.encode([query])
-    D, I = index.search(np.array(query_emb), top_k)
-    retrieved_chunks = [chunks[i] for i in I[0]]
+    """
+    Given a query, return the concatenated top_k most-relevant chunks.
+    Handles dimension mismatches and empty index.
+    """
+    if index is None or index.ntotal == 0:
+        return ""
+
+    # embed query
+    try:
+        query_emb = embedder.encode([query], convert_to_numpy=True)
+    except TypeError:
+        query_emb = embedder.encode([query])
+
+    query_emb = np.array(query_emb, dtype="float32")
+    query_emb = np.atleast_2d(query_emb)
+    query_emb = np.ascontiguousarray(query_emb)
+
+    # ensure top_k <= number of items in index
+    k = int(min(top_k, max(1, index.ntotal)))
+    D, I = index.search(query_emb, k)
+
+    idxs = [int(i) for i in I[0] if i >= 0 and i < len(chunks)]
+    retrieved_chunks = [chunks[i] for i in idxs]
     return " ".join(retrieved_chunks)
 
+
 def generate_answer(question, context):
-    """Generates answer from Gemini model given a question and context"""
+    """
+    Use Gemini to generate an answer based on context and question.
+    Returns a text string (or a helpful error message).
+    """
     prompt = f"""You are StudyMate, an AI assistant for students.
-Answer the question based only on the context below.
+Answer the question based only on the context below. If the context does not contain the answer, say you can't find it.
 
 Context:
 {context}
@@ -76,18 +163,20 @@ Context:
 Question: {question}
 Answer:"""
 
-    # Create a Gemini model handle
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        # contents can be a list; supply the prompt as single item
+        response = model.generate_content([prompt], generation_config={"max_output_tokens": 500})
+        # response.text usually contains the generated text
+        return getattr(response, "text", str(response))
+    except Exception as e:
+        return f"⚠️ Error generating answer: {e}"
 
-    # Generate response
-    response = model.generate_content(
-        [prompt],  # must be a list
-        generation_config={"max_output_tokens": 500}
-    )
-    return response.text
 
+# ------------------------------
+# Streamlit App
+# ------------------------------
 st.set_page_config(page_title="StudyMate - Q&A", layout="wide")
-
 st.title("📘 StudyMate: AI-Powered Q&A System")
 
 # Initialize session state
@@ -97,22 +186,34 @@ if "chunks" not in st.session_state:
     st.session_state.chunks = None
 if "index" not in st.session_state:
     st.session_state.index = None
+if "embeddings" not in st.session_state:
+    st.session_state.embeddings = None
 if "embedder" not in st.session_state:
+    # this can take a little time on first run
     st.session_state.embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
 # File uploader
 uploaded_file = st.file_uploader(
-    "📂 Upload your study material", 
-    type=["pdf", "docx", "pptx", "ppt"]
+    "📂 Upload your study material",
+    type=["pdf", "docx", "pptx", "ppt", "txt"]
 )
 
 if uploaded_file:
     with st.spinner("📖 Extracting text..."):
         text = extract_text(uploaded_file)
-        chunks = chunk_text(text)
-        st.session_state.chunks = chunks
-        st.session_state.index, _ = build_faiss_index(chunks, st.session_state.embedder)
-    st.success("✅ Document processed successfully!")
+        chunks = chunk_text(text, chunk_size=500)
+
+        if not chunks:
+            st.error("⚠️ No text found in the uploaded file. Try another file or check that the document contains selectable text.")
+        else:
+            try:
+                index, embeddings = build_faiss_index(chunks, st.session_state.embedder)
+                st.session_state.chunks = chunks
+                st.session_state.index = index
+                st.session_state.embeddings = embeddings
+                st.success("✅ Document processed successfully!")
+            except Exception as e:
+                st.error(f"⚠️ Failed to build index: {e}")
 
 # Clear Chat button
 if st.button("🗑️ Clear Chat"):
@@ -129,13 +230,19 @@ for i, (q, a) in enumerate(st.session_state.chat_history):
 question = st.text_input("Ask a question about your document")
 
 if st.button("Get Answer") and question.strip():
-    if st.session_state.index is not None:
+    if st.session_state.index is not None and st.session_state.chunks:
         with st.spinner("🤔 Thinking..."):
-            context = retrieve_answer(question, st.session_state.chunks, st.session_state.index, st.session_state.embedder)
+            context = retrieve_answer(
+                question,
+                st.session_state.chunks,
+                st.session_state.index,
+                st.session_state.embedder,
+                top_k=3,
+            )
             answer = generate_answer(question, context)
     else:
         answer = "⚠️ Please upload and process a document first."
-    
+
     # Save to history
     st.session_state.chat_history.append((question, answer))
     st.rerun()
