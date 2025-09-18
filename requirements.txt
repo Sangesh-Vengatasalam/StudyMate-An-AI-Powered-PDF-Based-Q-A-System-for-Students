@@ -1,0 +1,10 @@
+streamlit
+pymupdf
+python-pptx
+faiss-cpu
+sentence-transformers
+transformers
+python-dotenv
+ibm-watsonx-ai
+google-generativeai
+python-docx
