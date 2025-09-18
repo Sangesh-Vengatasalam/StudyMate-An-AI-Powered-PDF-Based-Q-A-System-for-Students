@@ -1,0 +1,141 @@
+import os
+import streamlit as st
+import fitz  # PyMuPDF for PDF
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import google.generativeai as genai
+from dotenv import load_dotenv
+from docx import Document
+from pptx import Presentation
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Configure Gemini client
+genai.configure(api_key=GEMINI_API_KEY)
+
+def extract_text(uploaded_file):
+    """Extract text from PDF, DOCX, or PPTX"""
+    file_name = uploaded_file.name.lower()
+
+    # PDF
+    if file_name.endswith(".pdf"):
+        doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+        text = ""
+        for page in doc:
+            text += page.get_text("text")
+        return text
+
+    # DOCX
+    elif file_name.endswith(".docx"):
+        doc = Document(uploaded_file)
+        text = "\n".join([para.text for para in doc.paragraphs])
+        return text
+
+    # PPTX
+    elif file_name.endswith(".pptx") or file_name.endswith(".ppt"):
+        prs = Presentation(uploaded_file)
+        text = ""
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text"):
+                    text += shape.text + "\n"
+        return text
+
+    else:
+        return "⚠️ Unsupported file format"
+
+def chunk_text(text, chunk_size=500):
+    """Splits text into chunks"""
+    words = text.split()
+    return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
+
+def build_faiss_index(chunks, embedder):
+    """Builds FAISS index from text chunks"""
+    embeddings = embedder.encode(chunks)
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(np.array(embeddings))
+    return index, embeddings
+
+def retrieve_answer(query, chunks, index, embedder, top_k=3):
+    """Retrieves most relevant chunks using FAISS"""
+    query_emb = embedder.encode([query])
+    D, I = index.search(np.array(query_emb), top_k)
+    retrieved_chunks = [chunks[i] for i in I[0]]
+    return " ".join(retrieved_chunks)
+
+def generate_answer(question, context):
+    """Generates answer from Gemini model given a question and context"""
+    prompt = f"""You are StudyMate, an AI assistant for students.
+Answer the question based only on the context below.
+
+Context:
+{context}
+
+Question: {question}
+Answer:"""
+
+    # Create a Gemini model handle
+    model = genai.GenerativeModel("gemini-1.5-flash")
+
+    # Generate response
+    response = model.generate_content(
+        [prompt],  # must be a list
+        generation_config={"max_output_tokens": 500}
+    )
+    return response.text
+
+st.set_page_config(page_title="StudyMate - Q&A", layout="wide")
+
+st.title("📘 StudyMate: AI-Powered Q&A System")
+
+# Initialize session state
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "chunks" not in st.session_state:
+    st.session_state.chunks = None
+if "index" not in st.session_state:
+    st.session_state.index = None
+if "embedder" not in st.session_state:
+    st.session_state.embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+# File uploader
+uploaded_file = st.file_uploader(
+    "📂 Upload your study material", 
+    type=["pdf", "docx", "pptx", "ppt"]
+)
+
+if uploaded_file:
+    with st.spinner("📖 Extracting text..."):
+        text = extract_text(uploaded_file)
+        chunks = chunk_text(text)
+        st.session_state.chunks = chunks
+        st.session_state.index, _ = build_faiss_index(chunks, st.session_state.embedder)
+    st.success("✅ Document processed successfully!")
+
+# Clear Chat button
+if st.button("🗑️ Clear Chat"):
+    st.session_state.chat_history = []
+    st.rerun()
+
+# Display chat history
+for i, (q, a) in enumerate(st.session_state.chat_history):
+    st.markdown(f"**Q{i+1}: {q}**")
+    st.markdown(f"📝 **Answer:** {a}")
+    st.markdown("---")
+
+# Question input at bottom
+question = st.text_input("Ask a question about your document")
+
+if st.button("Get Answer") and question.strip():
+    if st.session_state.index is not None:
+        with st.spinner("🤔 Thinking..."):
+            context = retrieve_answer(question, st.session_state.chunks, st.session_state.index, st.session_state.embedder)
+            answer = generate_answer(question, context)
+    else:
+        answer = "⚠️ Please upload and process a document first."
+    
+    # Save to history
+    st.session_state.chat_history.append((question, answer))
+    st.rerun()
